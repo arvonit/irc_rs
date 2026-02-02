@@ -1,7 +1,7 @@
 [package]
 name = "server"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -10,4 +10,4 @@ shared = { path = "../shared" }
 log = "0.4.14"
 env_logger = "0.9.0"
 uuid = { version = "0.8.2", features = ["v4"] }
-dashmap = "5.3.4"
+dashmap = "6.1.0"
