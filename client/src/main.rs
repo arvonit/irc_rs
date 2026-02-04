@@ -47,7 +47,7 @@ fn main() {
         println!("Usage: client <username>");
         quit::with_code(1);
     }
-    let hostname = "127.0.0.1:8080";
+    let hostname = "127.0.0.1:6667";
     let username = &args[1];
 
     // Connect to the server
@@ -101,7 +101,7 @@ fn send_handler(mut writer: TcpStream) {
             .expect("Failed to send message to the server.");
 
         // Exit if user wishes to
-        if message == "quit" || message == "exit" {
+        if message.to_lowercase() == "quit" || message.to_lowercase() == "exit" {
             break;
         }
     }

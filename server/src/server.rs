@@ -53,11 +53,14 @@ pub fn handle_connection(
         let message_str = str::from_utf8(&message_ascii)
             .expect("Client sent an invalid UTF-8 message.")
             .replace('\0', "");
-        println!("{:?}", message_str);
+        println!("Raw Message: {:?}", message_str);
 
         // Extract IRC command from client input
         let message = match Message::from(&message_str) {
-            Ok(message) => message,
+            Ok(message) => {
+                println!("Parsed Message: {:?}", message);
+                message
+            }
             Err(err) => {
                 // TODO: Fix reply code
                 let response =
@@ -67,11 +70,10 @@ pub fn handle_connection(
             }
         };
 
-        if handle_message(message, &users, &channels, user_id, hostname)
-            .expect("Failed to parse command.")
-            == CommandResponse::Quit
-        {
-            break;
+        match handle_message(message, &users, &channels, user_id, hostname) {
+            Ok(CommandResponse::Quit) => break,
+            Ok(CommandResponse::Continue) => {}
+            Err(e) => eprintln!("Error handling message: {e}"),
         }
     }
 
@@ -86,19 +88,25 @@ fn handle_message<'a>(
     user_id: Uuid,
     server_prefix: &str,
 ) -> Result<CommandResponse, Box<dyn std::error::Error + 'a>> {
-    // Get a reference to the user in the table
-    let user = users.get(&user_id).unwrap();
+    // Check if the user is registered
+    let is_registered = {
+        // Get a reference to the user in the table
+        let user = users.get(&user_id).unwrap();
 
-    // Update message's prefix to the user's in case we need to broadcast this message to other
-    // users
-    message.prefix = user.prefix();
+        // Update message's prefix to the user's in case we need to broadcast this message to other
+        // users
+        message.prefix = user.prefix();
+
+        // Return it
+        user.is_registered
+    };
 
     // In order for a user to become registered, the client has to send a NICK message with a valid
     // nickname and a USER message with their username. If all checks pass, they will receieve a
     // welcome message.
 
     // Only allow USER, NICK, and QUIT commands if user is not registered
-    if !user.is_registered
+    if !is_registered
         && !matches!(
             message.command,
             Command::User | Command::Nick | Command::Quit
@@ -112,9 +120,6 @@ fn handle_message<'a>(
         send_to_user(&response, &users, user_id)?;
         return Ok(CommandResponse::Continue);
     }
-
-    // TODO: Find more elegant way to handle dropping user
-    drop(user);
 
     // Perform command associated with message
     match message.command {
@@ -136,14 +141,14 @@ fn handle_message<'a>(
                 }
             };
 
-            // let mut lock = users.lock().expect("Unable to get lock on users table.");
-            // let mut user = lock.get_mut(&user_id).unwrap();
-            let mut user = users
-                .get_mut(&user_id)
-                .ok_or("Unable to find user in table with given ID.")?;
+            // Check if user is already registered
+            let is_registered = users
+                .get(&user_id)
+                .ok_or("Unable to find user in table with given ID.")?
+                .is_registered;
 
             // If the user is already registered, ignore the request and send ERR_ALREADYREGISTERED
-            if user.is_registered {
+            if is_registered {
                 let response = Response::new(
                     server_prefix,
                     ReplyCode::ERR_ALREADYREGISTRED,
@@ -154,7 +159,11 @@ fn handle_message<'a>(
                 return Ok(CommandResponse::Continue);
             }
 
-            user.username = Some(username);
+            // Set username (no longer holding any references)
+            users
+                .get_mut(&user_id)
+                .ok_or("Unable to find user in table with given ID.")?
+                .username = Some(username);
         }
         Command::Nick => {
             // Example: NICK Wiz
@@ -185,27 +194,27 @@ fn handle_message<'a>(
                 return Ok(CommandResponse::Continue);
             }
 
-            // let mut lock = users.lock().expect("Unable to get lock on users table.");
-            // let mut user = lock.get_mut(&user_id).unwrap();
-
-            let mut user = users
-                .get_mut(&user_id)
-                .ok_or("Unable to find user in table with given ID.")?;
-            user.nickname = Some(nickname);
+            // Update nickname and get registration status
+            let is_registered = {
+                let mut user = users
+                    .get_mut(&user_id)
+                    .ok_or("Unable to find user in table with given ID.")?;
+                user.nickname = Some(nickname);
+                user.is_registered
+            }; // RefMut dropped here
 
             // Only broadcast NICK message if user is registered
-            if user.is_registered {
+            if is_registered {
                 broadcast_to_all(&message, &users)?;
             }
         }
         Command::Away => {
-            // let mut lock = users.lock().expect("Unable to get lock on users table.");
-            let mut user = users.get_mut(&user_id).unwrap();
-
-            // Toggle away status
-            let is_away = !user.is_away;
-            user.is_away = is_away;
-            // drop(lock);
+            // Toggle away status and prepare response
+            let is_away = {
+                let mut user = users.get_mut(&user_id).unwrap();
+                user.is_away = !user.is_away;
+                user.is_away
+            }; // RefMut dropped here
 
             let response = if is_away {
                 Response::new(
@@ -244,7 +253,6 @@ fn handle_message<'a>(
                     let is_away = users
                         .get(&nickname_id)
                         .ok_or("Unable to find user in table with given ID")?
-                        // TODO: Determine if I need to call value()
                         .is_away;
                     if is_away {
                         let response = Response::new(
@@ -339,7 +347,7 @@ fn handle_message<'a>(
                     let response = Response::new(
                         server_prefix,
                         ReplyCode::ERR_NEEDMOREPARAMS,
-                        &["Specify which channel to join."],
+                        &["Specify which channel to leave."],
                     );
                     send_to_user(&response, &users, user_id)?;
                     return Ok(CommandResponse::Continue);
@@ -362,7 +370,7 @@ fn handle_message<'a>(
                 send_to_user(&response, &users, user_id)?;
             }
         }
-        Command::List => todo!(),
+        // Command::List => todo!(),
         _ => {
             // let response = Response {
             //     prefix: server_prefix.to_string(),
@@ -374,10 +382,16 @@ fn handle_message<'a>(
         }
     }
 
-    // let mut lock = users.lock().expect("Unable to get lock on users table.");
     let mut user = users
         .get_mut(&user_id)
         .ok_or("Unable to find user in table with given ID.")?;
+
+    // let is_registered = {
+    //     let user = users
+    //         .get(&user_id)
+    //         .ok_or("Unable to find user in table with given ID.")?;
+    //     user.is_registered && user.prefix() != None
+    // };
 
     // Send welcome message if user is now registered
     if !user.is_registered && user.prefix() != None {
@@ -396,108 +410,9 @@ fn handle_message<'a>(
         user.stream.write_all(response.to_irc().as_bytes())?;
     }
 
-    // drop(lock);
+    drop(user);
 
     Ok(CommandResponse::Continue)
-}
-
-/// Unused
-fn handle_user<'a>(
-    message: Message,
-    users: &'a UserTable,
-    user_id: Uuid,
-    server_prefix: &str,
-) -> Result<CommandResponse, Box<dyn std::error::Error + 'a>> {
-    // Example: USER guest 0 * :Ronnie Reagan
-
-    // We will only parse the first argument (username) and ignore the rest
-    let username = match message.params.get(0) {
-        Some(name) => name.clone(),
-        None => {
-            let response = Response::new(
-                server_prefix,
-                ReplyCode::ERR_NONICKNAMEGIVEN,
-                &["No nickname was given."],
-            );
-            send_to_user(&response, &users, user_id)?;
-            // user.stream.write_all(response.to_irc().as_bytes())?;
-
-            return Ok(CommandResponse::Continue);
-        }
-    };
-
-    // let mut lock = users.lock().expect("Unable to get lock on users table.");
-    let mut user = users
-        .get_mut(&user_id)
-        .ok_or("Unable to find user in table with given ID.")?;
-
-    // If the user is already registered, ignore the request and send ERR_ALREADYREGISTERED
-    if user.is_registered {
-        // drop(lock);
-        let response = Response::new(
-            server_prefix,
-            ReplyCode::ERR_ALREADYREGISTRED,
-            &["Cannot send USER message since the client is already registered."],
-        );
-
-        // Send response to client
-        // user.stream.write_all(response.to_irc().as_bytes())?;
-
-        send_to_user(&response, &users, user_id)?;
-        return Ok(CommandResponse::Continue);
-    }
-
-    user.username = Some(username);
-    return Ok(CommandResponse::Continue);
-}
-
-/// Unused
-fn handle_nick<'a>(
-    message: Message,
-    users: &'a UserTable,
-    user_id: Uuid,
-    server_prefix: &str,
-) -> Result<CommandResponse, Box<dyn std::error::Error + 'a>> {
-    // Example: NICK Wiz
-
-    // Get the first parameter in the message
-    let nickname = match message.params.get(0) {
-        Some(name) => name.clone(),
-        None => {
-            let response = Response::new(
-                server_prefix,
-                ReplyCode::ERR_NONICKNAMEGIVEN,
-                &["No nickname was given."],
-            );
-            // user.stream.write_all(response.to_irc().as_bytes())?;
-            send_to_user(&response, &users, user_id)?;
-            return Ok(CommandResponse::Continue);
-        }
-    };
-
-    if nickname_in_use(&nickname, &users) {
-        let response = Response::new(
-            server_prefix,
-            ReplyCode::ERR_NICKNAMEINUSE,
-            &["Nickname is already in use."],
-        );
-        // user.stream.write_all(response.to_irc().as_bytes())?;
-        send_to_user(&response, &users, user_id)?;
-        return Ok(CommandResponse::Continue);
-    }
-
-    // let mut lock = users.lock().expect("Unable to get lock on users table.");
-    let mut user = users.get_mut(&user_id).unwrap();
-    user.nickname = Some(nickname);
-    let is_registered = user.is_registered;
-    // drop(lock);
-
-    // Only broadcast NICK message if user is registered
-    if is_registered {
-        broadcast_to_all(&message, &users)?;
-        // broadcast_message(&message, users);
-    }
-    return Ok(CommandResponse::Continue);
 }
 
 /// This mutates the user table by writing with the stream
