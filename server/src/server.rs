@@ -233,6 +233,7 @@ fn handle_message<'a>(
             send_to_user(&response, &users, user_id)?;
         }
         Command::PrivMsg => {
+            // TODO: Do not allow messaging channels if user has not joined it
             // Example: PRIVMSG user :Hello there!
             //          PRIVMSG #channel :Hello there!
             if message.params.len() != 2 {
@@ -273,16 +274,37 @@ fn handle_message<'a>(
                     send_to_user(&response, &users, user_id)?;
                 }
             } else {
-                if let Some(channel) = channels.get(&recipient) {
-                    send_to_channel(&message, &users, channel.value())?;
-                } else {
+                let channel = match channels.get(&recipient) {
+                    Some(c) => c,
+                    None => {
+                        let response = Response::new(
+                            server_prefix,
+                            ReplyCode::ERR_NOSUCHCHANNEL,
+                            &["The given channel was not found."],
+                        );
+                        send_to_user(&response, &users, user_id)?;
+                        return Ok(CommandResponse::Continue);
+                    }
+                };
+
+                let in_channel = users
+                    .get(&user_id)
+                    .ok_or("Unable to find user in table with given ID.")?
+                    .channel
+                    .as_ref()
+                    .map_or(false, |c| c.name == recipient);
+
+                if !in_channel {
                     let response = Response::new(
                         server_prefix,
-                        ReplyCode::ERR_NOSUCHCHANNEL,
-                        &["The given channel was not found."],
+                        ReplyCode::ERR_CANNOTSENDTOCHAN,
+                        &["You are not in that channel."],
                     );
                     send_to_user(&response, &users, user_id)?;
+                    return Ok(CommandResponse::Continue);
                 }
+
+                send_to_channel(&message, &users, channel.value(), user_id)?;
             }
         }
         Command::Quit => {
@@ -294,6 +316,7 @@ fn handle_message<'a>(
             send_to_user(&acknowledgement_response, &users, user_id)?;
 
             // If the user is registered, tell everyone else that the user has left.
+            // TODO: ONLY broadcast to users in the same channel(s) as the user
             let is_registered = users
                 .get(&user_id)
                 .ok_or("Unable to find user in table with given ID.")?
@@ -336,8 +359,10 @@ fn handle_message<'a>(
             users
                 .get_mut(&user_id)
                 .ok_or("Unable to find user in table with given ID.")?
-                .channel = Some(channel);
-            // TODO: Broadcast
+                .channel = Some(channel.clone());
+
+            // Broadcast to all users in the channel
+            send_to_channel(&message, &users, &channel, user_id)?;
         }
         Command::Part => {
             let channel_name = match message.params.get(0) {
@@ -353,67 +378,212 @@ fn handle_message<'a>(
                 }
             };
 
-            let exists = channels.get(&channel_name).is_some();
-            if exists {
-                users
-                    .get_mut(&user_id)
-                    .ok_or("Unable to find user in table with given ID.")?
-                    .channel = None;
-                // TODO: Broadcast
-            } else {
+            // Look up channel and check user is actually in it
+            let channel = match channels.get(&channel_name) {
+                Some(c) => c.clone(),
+                None => {
+                    let response = Response::new(
+                        server_prefix,
+                        ReplyCode::ERR_NOSUCHCHANNEL,
+                        &["The given channel was not found."],
+                    );
+                    send_to_user(&response, &users, user_id)?;
+                    return Ok(CommandResponse::Continue);
+                }
+            };
+
+            let in_channel = users
+                .get(&user_id)
+                .ok_or("Unable to find user in table with given ID.")?
+                .channel
+                .as_ref()
+                .map(|c| c.name == channel_name)
+                .unwrap_or(false);
+
+            if !in_channel {
                 let response = Response::new(
                     server_prefix,
-                    ReplyCode::ERR_NOSUCHCHANNEL,
-                    &["The given channel was not found."],
+                    ReplyCode::ERR_NOTONCHANNEL,
+                    &["You are not in that channel."],
+                );
+                send_to_user(&response, &users, user_id)?;
+                return Ok(CommandResponse::Continue);
+            }
+
+            // Remove user from channel
+            users
+                .get_mut(&user_id)
+                .ok_or("Unable to find user in table with given ID.")?
+                .channel = None;
+
+            // Broadcast to channel after removing user
+            send_to_channel(&message, &users, &channel, user_id)?;
+        }
+        Command::Kick => {
+            // Example: KICK #general bob :Using profanity
+            let channel_name = match message.params.get(0) {
+                Some(name) => name.clone(),
+                None => {
+                    let response = Response::new(
+                        server_prefix,
+                        ReplyCode::ERR_NEEDMOREPARAMS,
+                        &["Specify a channel and user to kick."],
+                    );
+                    send_to_user(&response, &users, user_id)?;
+                    return Ok(CommandResponse::Continue);
+                }
+            };
+
+            let target_user = match message.params.get(1) {
+                Some(user) => user.clone(),
+                None => {
+                    let response = Response::new(
+                        server_prefix,
+                        ReplyCode::ERR_NEEDMOREPARAMS,
+                        &["Specify a user to kick."],
+                    );
+                    send_to_user(&response, &users, user_id)?;
+                    return Ok(CommandResponse::Continue);
+                }
+            };
+
+            // Verify channel exists
+            let channel = match channels.get(&channel_name) {
+                Some(c) => c.clone(),
+                None => {
+                    let response = Response::new(
+                        server_prefix,
+                        ReplyCode::ERR_NOSUCHCHANNEL,
+                        &["The given channel was not found."],
+                    );
+                    send_to_user(&response, &users, user_id)?;
+                    return Ok(CommandResponse::Continue);
+                }
+            };
+
+            // Check if kicker is in the channel
+            let kicker_in_channel = users
+                .get(&user_id)
+                .ok_or("Unable to find user in table with given ID.")?
+                .channel
+                .as_ref()
+                .map_or(false, |c| c.name == channel_name);
+
+            if !kicker_in_channel {
+                let response = Response::new(
+                    server_prefix,
+                    ReplyCode::ERR_NOTONCHANNEL,
+                    &["You are not in that channel."],
+                );
+                send_to_user(&response, &users, user_id)?;
+                return Ok(CommandResponse::Continue);
+            }
+
+            // Find target user ID
+            let target_id = match get_nickname_id(&target_user, &users) {
+                Some(id) => id,
+                None => {
+                    let response = Response::new(
+                        server_prefix,
+                        ReplyCode::ERR_NOSUCHNICK,
+                        &["The given user was not found."],
+                    );
+                    send_to_user(&response, &users, user_id)?;
+                    return Ok(CommandResponse::Continue);
+                }
+            };
+
+            // Check target is in the channel
+            let target_in_channel = users
+                .get(&target_id)
+                .ok_or("Unable to find target user in table with given ID.")?
+                .channel
+                .as_ref()
+                .map_or(false, |c| c.name == channel_name);
+
+            if !target_in_channel {
+                let response = Response::new(
+                    server_prefix,
+                    ReplyCode::ERR_USERNOTINCHANNEL,
+                    &["That user is not in the channel."],
+                );
+                send_to_user(&response, &users, user_id)?;
+                return Ok(CommandResponse::Continue);
+            }
+
+            // Broadcast KICK to channel
+            send_to_channel(&message, &users, &channel, user_id)?;
+
+            // Remove target from channel
+            users
+                .get_mut(&target_id)
+                .ok_or("Unable to find target user in table with given ID.")?
+                .channel = None;
+        }
+        Command::List => {
+            // Send one RPL_LIST per channel, then RPL_LISTEND
+            for entry in channels.iter() {
+                let channel = entry.value();
+                let user_count = users
+                    .iter()
+                    .filter(|user| {
+                        user.channel // It really isn't necessary to call value() first as done above
+                            .as_ref()
+                            .map_or(false, |c| c.name == channel.name)
+                    })
+                    .count();
+
+                // Send RPL_LIST for this channel
+                let response = Response::new(
+                    server_prefix,
+                    ReplyCode::RPL_LIST,
+                    &[&channel.name, &user_count.to_string()],
                 );
                 send_to_user(&response, &users, user_id)?;
             }
+
+            // At the end, send RPL_LISTEND
+            let response = Response::new(server_prefix, ReplyCode::RPL_LISTEND, &["End of LIST"]);
+            send_to_user(&response, &users, user_id)?;
         }
-        Command::Kick => send_to_user(&message, &users, user_id)?,
-        Command::List => send_to_user(&message, &users, user_id)?,
-        Command::Error => send_to_user(&message, &users, user_id)?,
-        Command::Ping => send_to_user(&message, &users, user_id)?,
-        Command::Pong => send_to_user(&message, &users, user_id)?,
-        _ => {
-            // let response = Response {
-            //     prefix: server_prefix.to_string(),
-            //     code: ReplyCode::RPL_WELCOME,
-            //     params: vec!["Welcome to the Internet Relay Network!".to_string()],
-            // };
-            // user.stream.write_all(response.to_irc().as_bytes())?;
-            send_to_user(&message, &users, user_id)?;
+        Command::Ping => {
+            // Ignore any parameters and send back a PONG message
+            let response = Message::new(
+                Some(server_prefix.to_string()),
+                Command::Pong,
+                &[server_prefix],
+            );
+            send_to_user(&response, &users, user_id)?;
         }
+        Command::Pong | Command::Error => {}
+        _ => send_to_user(&message, &users, user_id)?,
     }
 
-    let mut user = users
-        .get_mut(&user_id)
+    // Send welcome message if user has completed registration (has both nick and username)
+
+    let user = users
+        .get(&user_id)
         .ok_or("Unable to find user in table with given ID.")?;
+    let should_register = !user.is_registered && user.prefix().is_some();
+    let prefix = user.prefix();
+    drop(user); // Most drop explicitly here
 
-    // let is_registered = {
-    //     let user = users
-    //         .get(&user_id)
-    //         .ok_or("Unable to find user in table with given ID.")?;
-    //     user.is_registered && user.prefix() != None
-    // };
-
-    // Send welcome message if user is now registered
-    if !user.is_registered && user.prefix() != None {
+    if should_register {
+        let prefix = prefix.unwrap();
+        let mut user = users
+            .get_mut(&user_id)
+            .ok_or("Unable to find user in table with given ID.")?;
         user.is_registered = true;
         let response = Response::new(
-            &user.prefix().unwrap(),
+            &prefix,
             ReplyCode::RPL_WELCOME,
             &[
                 user.nickname.as_ref().unwrap(),
-                &format!(
-                    "Welcome to the Internet Relay Network {}",
-                    user.prefix().unwrap()
-                ),
+                &format!("Welcome to the Internet Relay Network {}", prefix),
             ],
         );
         user.stream.write_all(response.to_irc().as_bytes())?;
     }
-
-    drop(user);
 
     Ok(CommandResponse::Continue)
 }
@@ -436,6 +606,7 @@ pub fn send_to_channel<'a, T: ToIrc>(
     message: &T,
     users: &'a UserTable,
     channel: &Arc<Channel>,
+    id_to_exclude: Uuid,
 ) -> Result<(), Box<dyn std::error::Error + 'a>> {
     // Ok(users
     //     .iter_mut()
@@ -443,8 +614,9 @@ pub fn send_to_channel<'a, T: ToIrc>(
     //     .for_each(|(_, user)| user.stream.write_all(message.to_irc().as_bytes()).unwrap()))
 
     for mut entry in users.iter_mut() {
+        let id = *entry.key();
         let user = entry.value_mut();
-        if user.channel == Some(channel.clone()) {
+        if id != id_to_exclude && user.channel == Some(channel.clone()) {
             user.stream.write_all(message.to_irc().as_bytes())?;
         }
     }

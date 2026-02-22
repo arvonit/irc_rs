@@ -94,6 +94,7 @@ pub trait ToIrc: ToString {
     }
 }
 
+// TODO: Add colon for last param that has spaces in it (I think) when formatting String output
 impl Message {
     /// Parse an IRC message from a raw input string. Return a message if the input is formatted
     /// properly. Otherwise, return an error describing the issue.

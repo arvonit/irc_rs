@@ -1,1 +1,6 @@
-/target
+target
+
+# Hide Python scripts
+.venv
+*.py
+requirements.txt
