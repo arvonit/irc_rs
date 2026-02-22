@@ -339,7 +339,6 @@ fn handle_message<'a>(
                 .channel = Some(channel);
             // TODO: Broadcast
         }
-        // Command::Kick => todo!(),
         Command::Part => {
             let channel_name = match message.params.get(0) {
                 Some(name) => name.clone(),
@@ -370,7 +369,11 @@ fn handle_message<'a>(
                 send_to_user(&response, &users, user_id)?;
             }
         }
-        // Command::List => todo!(),
+        Command::Kick => send_to_user(&message, &users, user_id)?,
+        Command::List => send_to_user(&message, &users, user_id)?,
+        Command::Error => send_to_user(&message, &users, user_id)?,
+        Command::Ping => send_to_user(&message, &users, user_id)?,
+        Command::Pong => send_to_user(&message, &users, user_id)?,
         _ => {
             // let response = Response {
             //     prefix: server_prefix.to_string(),
